@@ -36,7 +36,12 @@ CREATE TABLE IF NOT EXISTS cleanup_operations (timestamp REAL, action TEXT, deta
 
 class Database:
     def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            fallback = Path.cwd() / ".disklens" / path.name
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            path = fallback
         self.path = path.absolute()
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
