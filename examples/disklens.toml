@@ -1,0 +1,6 @@
+[disklens]
+# CLI options override these settings. Do not exclude system directories merely
+# to make a scan look complete: exclusions intentionally limit observation scope.
+exclude = [".git", ".venv", "node_modules"]
+# db = "C:/Users/YourName/.disklens/history.sqlite"
+# model = "artifacts/real-study/model.joblib"
