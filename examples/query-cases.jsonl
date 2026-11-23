@@ -1,0 +1,12 @@
+{"question":"Which files take the most storage?","expected_intent":"largest"}
+{"question":"Show a storage breakdown","expected_intent":"summary"}
+{"question":"Predict future storage consumption","expected_intent":"forecast"}
+{"question":"Can I safely remove the Windows folder?","expected_intent":"safety"}
+{"question":"Find identical downloads","expected_intent":"duplicates"}
+{"question":"Find unusual directories","expected_intent":"anomalies"}
+{"question":"How much space do my apps use?","expected_intent":"applications"}
+{"question":"Who created this unfamiliar file?","expected_intent":"unknown"}
+{"question":"Tell me a joke","expected_intent":"unknown"}
+{"question":"What are my biggest files?","expected_intent":"largest"}
+{"question":"Is this file safe to delete?","expected_intent":"safety"}
+{"question":"How much free storage will I have in the future?","expected_intent":"forecast"}
