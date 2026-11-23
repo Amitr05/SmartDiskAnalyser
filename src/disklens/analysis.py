@@ -45,6 +45,8 @@ def directories(db, scan):
 
 
 def summary(db, scan):
+    from .visualization import get_category_summary
+
     breakdown = [
         dict(r)
         for r in db.conn.execute(
@@ -59,6 +61,7 @@ def summary(db, scan):
     ]
     return {
         "scan": scan,
+        "categories": get_category_summary(db, scan["id"]),
         "largest_files": largest(db, scan["id"]),
         "largest_directories": sorted(directories(db, scan), key=lambda r: -r["bytes"])[:20],
         "extension_breakdown": breakdown,

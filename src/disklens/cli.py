@@ -1,4 +1,4 @@
-"""CLI-first DiskLens. All filesystem analysis is non-destructive."""
+"""CLI-first DiskLens. All filesystem analysis is non-destructive and read-only."""
 
 import csv
 import functools
@@ -19,7 +19,9 @@ from rich.console import Console
 from rich.table import Table
 
 from . import analysis
+from .apps import analyze_application_storage
 from .database import Database
+from .drives import get_available_drives, get_scannable_drives
 from .duplicates import digest, find_duplicates
 from .knowledge import category_rule, explain
 from .ml.data import demo_dataset, load_jsonl, reconcile
@@ -27,9 +29,19 @@ from .ml.training import load_model, predict, train
 from .query import answer
 from .safety import assess
 from .scanner import metadata
+from .visualization import (
+    build_size_tree,
+    format_bytes,
+    get_category_summary,
+    render_bar,
+    render_category_table,
+    render_drives_table,
+    render_html_report,
+)
 
 app = typer.Typer(
-    help="DiskLens: offline, risk-aware filesystem intelligence. Read-only analysis.", no_args_is_help=False
+    help="DiskLens: Intelligent, risk-aware Windows filesystem explorer and disk analyzer.",
+    no_args_is_help=False,
 )
 console = Console(stderr=True)
 
@@ -81,14 +93,19 @@ def emit(ctx, value):
                 clean[k] = cell
             writer.writerow(clean)
         text = buffer.getvalue()
-    else:
-        text = json.dumps(value, indent=2, ensure_ascii=True, allow_nan=False)
-        if fmt == "html":
+    elif fmt == "html":
+        if isinstance(value, dict):
+            text = render_html_report(value)
+        else:
+            json_text = json.dumps(value, indent=2, ensure_ascii=True, allow_nan=False)
             text = (
                 '<!doctype html><meta charset="utf-8"><title>DiskLens report</title><h1>DiskLens</h1><pre>'
-                + html.escape(text)
+                + html.escape(json_text)
                 + "</pre>"
             )
+    else:
+        text = json.dumps(value, indent=2, ensure_ascii=True, allow_nan=False)
+
     output = ctx.obj["output"]
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +113,6 @@ def emit(ctx, value):
             handle.write(text + "\n")
         console.print(f"Created {output}", markup=False)
     elif fmt == "terminal":
-        # Rich formatting, with escaping disabled for untrusted path text.
         Console().print(text, markup=False, highlight=False)
     else:
         typer.echo(text)
@@ -122,7 +138,12 @@ def inspect_path(ctx, path):
     if model:
         result["ml"] = predict(model, rec, ctx.obj["allow_demo"])
     else:
-        result["ml"] = {"decision": "unknown", "reason": "No trained model loaded. Rules are not ML."}
+        result["ml"] = {
+            "status": "not_loaded",
+            "decision": "unknown",
+            "category": "unknown",
+            "reason": "No trained model loaded. Pass --model <path> to enable ML predictions.",
+        }
     return result
 
 
@@ -172,17 +193,85 @@ def main(
 
 @app.command()
 @guarded
+def drives(ctx: typer.Context):
+    """Discover and display all mounted Windows drives, capacity, and usage bars."""
+    drive_list = get_available_drives()
+    if ctx.obj["format"] == "terminal" and not ctx.obj.get("output"):
+        Console().print(render_drives_table(drive_list))
+    else:
+        emit(ctx, [d.to_dict() for d in drive_list])
+
+
+@app.command()
+@guarded
 def scan(
     ctx: typer.Context,
-    path: Path,
+    path: Annotated[
+        Path | None,
+        typer.Argument(help="Path or drive to scan. If omitted with --all, scans all available drives."),
+    ] = None,
+    all: Annotated[
+        bool,
+        typer.Option("--all", "-a", help="Scan all available suitable drives automatically."),
+    ] = False,
     exclude: Annotated[
         list[str] | None, typer.Option(help="Repeat glob patterns, matched to names or relative paths.")
     ] = None,
 ):
-    """Stream directory/drive metadata into SQLite. Ctrl+C saves a cancelled scan."""
+    """Stream directory or drive metadata into SQLite. Use --all to scan entire computer."""
     with database(ctx) as db:
+        excludes = list(ctx.obj["exclude"]) + (exclude or [])
+
+        # Handle --all drives scan
+        if all:
+            scannable = get_scannable_drives()
+            if not scannable:
+                console.print("[yellow]No accessible drives found to scan.[/yellow]")
+                return
+            console.print(f"[bold cyan]Scanning all available drives ({len(scannable)} detected)...[/bold cyan]")
+            results = []
+            for d in scannable:
+                console.print(f"\n[bold]Scanning drive {d.path} ({d.label or d.drive_type})...[/bold]")
+                progress = (lambda n: console.print(f"  {n:,} files scanned")) if ctx.obj["verbose"] else None
+                try:
+                    res = db.scan(Path(d.path), excludes, progress)
+                    results.append(res)
+                    console.print(f"  ✓ Finished {d.path}: {res['file_count']:,} files ({format_bytes(res['unique_bytes'])})")
+                except Exception as exc:  # noqa: BLE001
+                    console.print(f"  ✗ Error scanning {d.path}: {exc}", style="red")
+
+            summary_report = {
+                "scan_type": "all_drives",
+                "drives_scanned": len(results),
+                "scans": results,
+                "total_files": sum(s.get("file_count", 0) for s in results),
+                "total_logical_bytes": sum(s.get("logical_bytes", 0) for s in results),
+                "total_unique_bytes": sum(s.get("unique_bytes", 0) for s in results),
+            }
+            if ctx.obj["format"] == "terminal" and not ctx.obj.get("output"):
+                console.rule("[bold green]Computer Scan Complete[/bold green]")
+                console.print(
+                    f"Drives Scanned: [bold]{len(results)}[/] | "
+                    f"Total Files: [bold]{summary_report['total_files']:,}[/] | "
+                    f"Total Storage: [bold green]{format_bytes(summary_report['total_unique_bytes'])}[/bold green]"
+                )
+            else:
+                emit(ctx, summary_report)
+            return
+
+        if path is None:
+            if sys.stdin.isatty():
+                console.print(render_drives_table(get_available_drives()))
+                choice = typer.prompt("Enter drive letter or path to scan (or 'all' for full scan)", default="all")
+                if choice.strip().lower() == "all":
+                    ctx.invoke(scan, path=None, all=True, exclude=exclude)
+                    return
+                path = Path(choice.strip())
+            else:
+                raise ValueError("Specify a path to scan or pass --all to scan all drives.")
+
         progress = (lambda n: console.print(f"{n:,} files scanned")) if ctx.obj["verbose"] else None
-        emit(ctx, db.scan(normalize(path), list(ctx.obj["exclude"]) + (exclude or []), progress))
+        emit(ctx, db.scan(normalize(path), excludes, progress))
 
 
 def selected(ctx, db, path=None, scan_id=None):
@@ -196,19 +285,117 @@ def selected(ctx, db, path=None, scan_id=None):
 def analyze(ctx: typer.Context, path: Path | None = None, scan_id: str | None = None):
     """Scan a supplied path, or analyze a saved scan (latest by default)."""
     with database(ctx) as db:
-        emit(ctx, analysis.summary(db, selected(ctx, db, path, scan_id)))
+        current = selected(ctx, db, path, scan_id)
+        summary_data = analysis.summary(db, current)
+        cat_summary = get_category_summary(db, current["id"])
+        summary_data["categories"] = cat_summary
+
+        if ctx.obj["format"] == "terminal" and not ctx.obj.get("output"):
+            console.rule(f"[bold cyan]Storage Analysis: {current['root']}[/bold cyan]")
+            if current.get("volume_total"):
+                vol_bar = render_bar(current.get("volume_used", 0), current.get("volume_total", 1))
+                console.print(
+                    f"Volume Usage: [bold]{current['root'][:3]}[/] "
+                    f"{format_bytes(current.get('volume_used', 0))} used / {format_bytes(current.get('volume_total', 0))} total "
+                    f"{vol_bar}"
+                )
+            console.print(
+                f"Scanned Scope: [green]{current['file_count']:,} files[/], "
+                f"[bold green]{format_bytes(current['unique_bytes'])} unique[/] "
+                f"({format_bytes(current['logical_bytes'])} logical). Status: [bold]{current['status'].upper()}[/]."
+            )
+
+            # High-level category breakdown
+            if cat_summary:
+                Console().print(render_category_table(cat_summary, current["unique_bytes"]))
+
+            # Largest directories
+            largest_dirs = summary_data.get("largest_directories", [])[:10]
+            if largest_dirs:
+                dt = Table(title="Largest Directories", show_lines=False)
+                dt.add_column("Directory", style="cyan")
+                dt.add_column("Size", justify="right", style="bold green")
+                dt.add_column("Files", justify="right", style="dim")
+                for d in largest_dirs:
+                    dt.add_row(d["path"], format_bytes(d["bytes"]), f"{d['files']:,}")
+                Console().print(dt)
+
+            # Largest files
+            largest_files = summary_data.get("largest_files", [])[:10]
+            if largest_files:
+                ft = Table(title="Largest Files", show_lines=False)
+                ft.add_column("Path", style="dim")
+                ft.add_column("Size", justify="right", style="bold yellow")
+                ft.add_column("Risk", style="bold")
+                for f in largest_files:
+                    ft.add_row(f["path"], format_bytes(f["size"]), assess(f).risk)
+                Console().print(ft)
+        else:
+            emit(ctx, summary_data)
+
+
+@app.command()
+@guarded
+def tree(
+    ctx: typer.Context,
+    path: Annotated[Path | None, typer.Argument(help="Root directory for tree visualization")] = None,
+    depth: Annotated[int, typer.Option("--depth", "-d", help="Maximum directory depth (default 2)")] = 2,
+    scan_id: Annotated[str | None, typer.Option(help="Saved scan ID (defaults to latest)")] = None,
+):
+    """Display a directory size hierarchy tree with branch sizes."""
+    with database(ctx) as db:
+        current = selected(ctx, db, path, scan_id)
+        rich_tree = build_size_tree(db, current["id"], current["root"], max_depth=depth)
+        if ctx.obj["format"] == "terminal" and not ctx.obj.get("output"):
+            Console().print(rich_tree)
+        else:
+            emit(ctx, {"scan": current, "directories": analysis.directories(db, current)})
+
+
+@app.command()
+@guarded
+def categories(
+    ctx: typer.Context,
+    path: Annotated[Path | None, typer.Argument(help="Path to analyze")] = None,
+    scan_id: Annotated[str | None, typer.Option(help="Saved scan ID (defaults to latest)")] = None,
+):
+    """Display storage distribution grouped by high-level category with usage bars."""
+    with database(ctx) as db:
+        current = selected(ctx, db, path, scan_id)
+        cat_summary = get_category_summary(db, current["id"])
+        if ctx.obj["format"] == "terminal" and not ctx.obj.get("output"):
+            Console().print(render_category_table(cat_summary, current["unique_bytes"]))
+        else:
+            emit(ctx, {"scan": current, "categories": cat_summary})
 
 
 @app.command()
 @guarded
 def inspect(ctx: typer.Context, path: Path, deep: bool = False):
-    """Explain a live path; --deep opts into reading at most 32 header bytes of a file."""
+    """Explain a file or folder: purpose, owning application, importance, and safety."""
     result = inspect_path(ctx, path)
     if deep and not result["facts"]["is_directory"]:
         from .identification import identify
 
         result["format_inspection"] = identify(normalize(path))
-    emit(ctx, result)
+
+    if ctx.obj["format"] == "terminal" and not ctx.obj.get("output"):
+        know = result.get("knowledge", {})
+        safety = result.get("safety", {})
+        console.rule(f"[bold cyan]Inspection: {path}[/bold cyan]")
+        console.print(f"[bold]Title:[/] {know.get('title', 'Unknown')}")
+        console.print(f"[bold]Owning App / Component:[/] [cyan]{know.get('owner', 'Unknown')}[/cyan]")
+        console.print(f"[bold]Purpose:[/] {know.get('purpose', 'N/A')}")
+        console.print(f"[bold]Importance:[/] {know.get('importance', 'N/A')}")
+        console.print(f"[bold]Recreatable:[/] {know.get('recreatable', 'N/A')}")
+        console.print(f"[bold]Deletion Consequences:[/] {know.get('consequences', 'N/A')}")
+        console.print(f"[bold]Safe Cleanup Recommendation:[/] [green]{know.get('recommendation', 'N/A')}[/green]")
+        console.print(f"\n[bold]Safety Risk Tier:[/] [bold red if safety.get('risk')=='CRITICAL' else 'yellow']{safety.get('risk')}[/]")
+        console.print(f"[bold]Recommended Action:[/] {safety.get('action')}")
+        if result.get("format_inspection"):
+            console.print(f"[bold]Format Magic Bytes:[/] {result['format_inspection'].get('signature_hint')}")
+    else:
+        emit(ctx, result)
 
 
 @app.command()
@@ -235,22 +422,65 @@ def largest(ctx: typer.Context, path: Path | None = None, limit: int = 20, scan_
         raise ValueError("limit must be 1..10000")
     with database(ctx) as db:
         current = selected(ctx, db, path, scan_id)
-        emit(ctx, analysis.largest(db, current["id"], limit))
+        files = analysis.largest(db, current["id"], limit)
+        if ctx.obj["format"] == "terminal" and not ctx.obj.get("output"):
+            t = Table(title=f"Top {len(files)} Largest Files ({current['root']})", show_lines=False)
+            t.add_column("#", justify="right", style="dim")
+            t.add_column("File Path", style="cyan")
+            t.add_column("Size", justify="right", style="bold yellow")
+            t.add_column("Risk Tier", style="bold")
+            t.add_column("Context", style="dim")
+            for i, f in enumerate(files, 1):
+                t.add_row(
+                    str(i),
+                    f["path"],
+                    format_bytes(f["size"]),
+                    assess(f).risk,
+                    explain(f["path"]).get("title", ""),
+                )
+            Console().print(t)
+        else:
+            emit(ctx, files)
 
 
 @app.command()
 @guarded
 def duplicates(ctx: typer.Context, path: Path | None = None, scan_id: str | None = None):
-    """Opt into hashing same-size candidates and verifying bytes. Never delete copies."""
+    """Find verified duplicate files via SHA-256 and byte comparison. Never delete copies."""
     with database(ctx) as db:
         current = selected(ctx, db, path, scan_id)
-        emit(ctx, {"scan": current, **find_duplicates(db, current["id"])})
+        dup_data = find_duplicates(db, current["id"])
+        payload = {"scan": current, **dup_data}
+        if ctx.obj["format"] == "terminal" and not ctx.obj.get("output"):
+            groups = dup_data.get("groups", [])
+            pot_bytes = dup_data.get("potential_bytes", 0)
+            console.rule(f"[bold cyan]Duplicate Files Analysis: {current['root']}[/bold cyan]")
+            if not groups:
+                console.print("[green]No content-verified duplicate groups found.[/green]")
+            else:
+                console.print(
+                    f"Found [bold yellow]{len(groups)}[/] duplicate groups. "
+                    f"Potential reclaimable storage: [bold green]{format_bytes(pot_bytes)}[/bold green]."
+                )
+                for i, g in enumerate(groups[:10], 1):
+                    t = Table(
+                        title=f"Group #{i} — {format_bytes(g['size_each'])} each (SHA-256: {g['sha256'][:12]}...)",
+                        show_lines=False,
+                    )
+                    t.add_column("Identical File Copies", style="cyan")
+                    for p in g["paths"]:
+                        t.add_row(p)
+                    Console().print(t)
+                if len(groups) > 10:
+                    console.print(f"[dim]... and {len(groups) - 10} more duplicate groups.[/dim]")
+        else:
+            emit(ctx, payload)
 
 
 @app.command()
 @guarded
 def anomalies(ctx: typer.Context, path: Path | None = None, scan_id: str | None = None):
-    """Fit Isolation Forest on directory metadata (no anomaly => deletion inference)."""
+    """Fit Isolation Forest on directory metadata to detect structural outliers."""
     with database(ctx) as db:
         current = selected(ctx, db, path, scan_id)
         result = analysis.anomalies(db, current)
@@ -265,9 +495,7 @@ def anomalies(ctx: typer.Context, path: Path | None = None, scan_id: str | None 
 def recommendations(ctx, db, current, limit):
     model = model_for(ctx)
     rows = []
-    # Limit expensive inference; this is explicitly a largest-file review shortlist.
     for rec in analysis.largest(db, current["id"], limit):
-        # Refresh live metadata before producing a review shortlist from historical facts.
         try:
             live_rec = metadata(Path(rec["path"]), Path(current["root"])).to_dict()
         except OSError:
@@ -339,15 +567,84 @@ def cleanup(
         current = db.latest(scan_id)
         result = recommendations(ctx, db, current, limit)
         db.audit("dry_run_review", {"scan_id": current["id"], "review_items": len(result["review_items"])})
-        emit(ctx, result)
+        if ctx.obj["format"] == "terminal" and not ctx.obj.get("output"):
+            items = result.get("review_items", [])
+            console.rule("[bold cyan]Cleanup Review Shortlist (Read-Only)[/bold cyan]")
+            if not items:
+                console.print("[green]No disposable cleanup candidates identified in the top files.[/green]")
+            else:
+                t = Table(title=f"Review Candidates ({len(items)} items)", show_lines=False)
+                t.add_column("Candidate Path", style="cyan")
+                t.add_column("Size", justify="right", style="bold yellow")
+                t.add_column("Risk", style="bold")
+                t.add_column("Owning App / Context", style="green")
+                t.add_column("Recommended Action", style="dim")
+                for it in items[:25]:
+                    exp = explain(it["path"])
+                    t.add_row(
+                        it["path"],
+                        format_bytes(it["bytes"]),
+                        it["safety"]["risk"],
+                        exp.get("owner", exp.get("title", "")),
+                        exp.get("recommendation", it.get("action", "")),
+                    )
+                Console().print(t)
+                console.print(
+                    f"\n[bold]Potential Review Candidates:[/] {len(items)} files | "
+                    f"[bold yellow]Candidate Storage:[/] {format_bytes(sum(i['bytes'] for i in items))}\n"
+                    f"[dim]Note: DiskLens is read-only. Clean up via owning applications or Windows Settings > System > Storage.[/dim]"
+                )
+        else:
+            emit(ctx, result)
 
 
 @app.command()
 @guarded
 def apps(ctx: typer.Context, scan_id: str | None = None):
-    """Summarize application/developer storage by path hints, not installed-app verification."""
+    """Summarize storage associated with installed applications and developer environments."""
     with database(ctx) as db:
-        emit(ctx, analysis.applications(db, db.latest(scan_id)))
+        current = db.latest(scan_id)
+        app_data = analyze_application_storage(db, current)
+        if ctx.obj["format"] == "terminal" and not ctx.obj.get("output"):
+            console.rule("[bold cyan]Application & Developer Storage Analysis[/bold cyan]")
+            reg_apps = app_data.get("confirmed_registry_apps", [])
+            if reg_apps:
+                t1 = Table(title="Confirmed Installed Applications (Windows Registry)", show_lines=False)
+                t1.add_column("Application Name", style="bold green")
+                t1.add_column("Publisher", style="cyan")
+                t1.add_column("Version", style="dim")
+                t1.add_column("Storage", justify="right", style="bold yellow")
+                for item in reg_apps:
+                    t1.add_row(
+                        item["name"],
+                        item.get("publisher", ""),
+                        item.get("version", ""),
+                        format_bytes(item["bytes"]),
+                    )
+                Console().print(t1)
+
+            inferred = app_data.get("inferred_environments", [])
+            if inferred:
+                t2 = Table(title="Developer Environments & Tool Ecosystems", show_lines=False)
+                t2.add_column("Ecosystem", style="bold magenta")
+                t2.add_column("Category", style="cyan")
+                t2.add_column("Files", justify="right")
+                t2.add_column("Storage", justify="right", style="bold yellow")
+                t2.add_column("Description", style="dim")
+                for env in inferred:
+                    t2.add_row(
+                        env["name"],
+                        env.get("category", ""),
+                        f"{env.get('files', 0):,}",
+                        format_bytes(env["bytes"]),
+                        env.get("description", ""),
+                    )
+                Console().print(t2)
+
+            if not reg_apps and not inferred:
+                console.print("[dim]No confirmed applications or developer environments matched in this scan scope.[/dim]")
+        else:
+            emit(ctx, app_data)
 
 
 @app.command()
@@ -379,12 +676,13 @@ def compare(ctx: typer.Context, first: str | None = None, second: str | None = N
 @app.command()
 @guarded
 def report(ctx: typer.Context, scan_id: str | None = None):
-    """Full non-hashing report: analysis, anomalies, app hints, forecast and review."""
+    """Full non-hashing report: analysis, categories, anomalies, app hints, forecast and review."""
     with database(ctx) as db:
         current = db.latest(scan_id)
         result = analysis.summary(db, current)
         result.update(
             {
+                "categories": get_category_summary(db, current["id"]),
                 "anomalies": analysis.anomalies(db, current),
                 "applications": analysis.applications(db, current),
                 "forecast": analysis.forecast(
@@ -407,62 +705,126 @@ def ask(ctx: typer.Context, question: str, scan_id: str | None = None):
 
 @app.command()
 @guarded
-def explore(ctx: typer.Context, path: Path):
-    """Interactive live explorer: index navigation, parent, sort, filter, search, inspect."""
+def explore(
+    ctx: typer.Context,
+    path: Annotated[Path | None, typer.Argument(help="Initial directory to explore")] = None,
+):
+    """Interactive live explorer: drive selection, index navigation, sort, filter, and file inspect."""
     if not sys.stdin.isatty():
         raise ValueError("Explorer requires an interactive terminal. Use analyze for automation.")
-    current = normalize(path)
+
+    current = normalize(path) if path else Path.home()
+    if not current.exists() or not current.is_dir():
+        current = Path.home()
+
     sort_by, needle = "name", ""
     while True:
         if not current.is_dir() or current.is_symlink():
-            raise ValueError("Explorer requires a real directory")
-        entries = []
-        with os.scandir(current) as handle:
-            for entry in handle:
-                if needle.casefold() not in entry.name.casefold():
-                    continue
-                try:
-                    rec = metadata(Path(entry.path), current).to_dict()
-                    if not rec["is_link"]:
-                        entries.append(rec)
-                except OSError as exc:
-                    console.print(str(exc), markup=False)
-        entries.sort(
-            key=lambda r: (
-                (-r["size"], r["name"])
-                if sort_by == "size"
-                else (not r["is_directory"], r["name"].casefold())
-            )
-        )
-        table = Table(
-            title=str(current), caption="Directory entry sizes are NOT subtree sizes; use analyze for totals."
-        )
-        for title in ("#", "Name", "Type", "Bytes", "Risk"):
-            table.add_column(title)
-        for i, rec in enumerate(entries[:200]):
-            from rich.text import Text
+            current = Path.home()
 
-            table.add_row(
-                str(i),
-                Text(rec["name"]),
-                "dir" if rec["is_directory"] else "file",
-                str(rec["size"]),
-                assess(rec).risk,
-            )
-        console.print(table)
-        choice = typer.prompt("index to open/inspect | .. | sort name/size | find text | q")
+        entries = []
+        scan_error = None
+        try:
+            with os.scandir(current) as handle:
+                for entry in handle:
+                    if needle and needle.casefold() not in entry.name.casefold():
+                        continue
+                    try:
+                        rec = metadata(Path(entry.path), current).to_dict()
+                        if not rec["is_link"]:
+                            entries.append(rec)
+                    except OSError:
+                        pass
+        except OSError as exc:
+            scan_error = str(exc)
+
+        # Sorting logic
+        if sort_by == "size":
+            entries.sort(key=lambda r: (-r["size"], r["name"].casefold()))
+        elif sort_by == "type":
+            entries.sort(key=lambda r: (not r["is_directory"], r["extension"].casefold(), r["name"].casefold()))
+        elif sort_by == "date":
+            entries.sort(key=lambda r: (-r.get("mtime_ns", 0), r["name"].casefold()))
+        else:
+            entries.sort(key=lambda r: (not r["is_directory"], r["name"].casefold()))
+
+        console.rule(f"[bold cyan]Explorer: {current}[/bold cyan]")
+        if scan_error:
+            console.print(f"[red]Warning reading directory: {scan_error}[/red]")
+
+        table = Table(
+            caption=f"Showing {min(len(entries), 100)} of {len(entries)} items (sort: {sort_by}, filter: '{needle or 'none'}')",
+            show_lines=False,
+        )
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("Type", style="magenta")
+        table.add_column("Name", style="bold")
+        table.add_column("Size", justify="right", style="green")
+        table.add_column("Risk", style="bold")
+        table.add_column("Description", style="dim")
+
+        for i, rec in enumerate(entries[:100]):
+            r_type = "DIR" if rec["is_directory"] else "FILE"
+            r_size = "-" if rec["is_directory"] else format_bytes(rec["size"])
+            assessment = assess(rec)
+            desc = explain(rec["path"]).get("title", "")
+            table.add_row(str(i), r_type, rec["name"], r_size, assessment.risk, desc)
+
+        Console().print(table)
+        console.print(
+            "[dim]Commands: <#>=enter/inspect | ..=up | drive=switch drive | open <#>=launch | find <text> | sort <name/size/type/date> | q=exit[/dim]"
+        )
+        choice = typer.prompt("Action", default="..")
+        choice = choice.strip()
+
         if choice == "q":
             break
-        if choice == "..":
-            current = current.parent
+        elif choice == "..":
+            if current.parent != current:
+                current = current.parent
+        elif choice == "drive":
+            d_list = [d for d in get_available_drives() if d.is_ready]
+            console.print("\nAvailable drives:")
+            for idx, d in enumerate(d_list, 1):
+                console.print(f"  {idx}. {d.path} ({d.label or d.drive_type}) — {format_bytes(d.free_bytes)} free")
+            d_pick = typer.prompt("Select drive number", default="1")
+            if d_pick.isdigit() and 1 <= int(d_pick) <= len(d_list):
+                current = Path(d_list[int(d_pick) - 1].path)
+        elif choice.startswith("open "):
+            idx_str = choice[5:].strip()
+            if idx_str.isdigit() and int(idx_str) < len(entries):
+                target_p = Path(entries[int(idx_str)]["path"])
+                try:
+                    if os.name == "nt":
+                        os.startfile(str(target_p))
+                    else:
+                        import subprocess
+                        subprocess.Popen(["xdg-open", str(target_p)])
+                    console.print(f"[green]Opened {target_p.name} in default application.[/green]")
+                except Exception as exc:  # noqa: BLE001
+                    console.print(f"[red]Error opening file: {exc}[/red]")
+        elif choice.startswith("inspect "):
+            idx_str = choice[8:].strip()
+            if idx_str.isdigit() and int(idx_str) < len(entries):
+                emit(ctx, inspect_path(ctx, Path(entries[int(idx_str)]["path"])))
         elif choice.startswith("sort "):
-            sort_by = choice[5:]
+            sub = choice[5:].strip().lower()
+            if sub in ("name", "size", "type", "date"):
+                sort_by = sub
         elif choice.startswith("find "):
-            needle = choice[5:]
-        elif choice.isdigit() and int(choice) < min(len(entries), 200):
+            needle = choice[5:].strip()
+        elif choice == "find":
+            needle = ""
+        elif choice.isdigit() and int(choice) < len(entries):
             rec = entries[int(choice)]
             if rec["is_directory"]:
-                current = Path(rec["path"])
+                next_dir = Path(rec["path"])
+                try:
+                    with os.scandir(next_dir):
+                        pass
+                    current = next_dir
+                except OSError as exc:
+                    console.print(f"[red]Access denied to {next_dir.name}: {exc}[/red]")
             else:
                 emit(ctx, inspect_path(ctx, Path(rec["path"])))
 
@@ -610,44 +972,71 @@ def benchmark_command(
 
 
 def interactive(ctx):
-    options = [
-        ("Analyze Drive", analyze),
-        ("Explore Directories", explore),
-        ("Find Largest Files", largest),
-        ("Explain File or Folder", inspect),
-        ("Analyze Deletion Risk", risk),
-        ("Find Duplicate Files", duplicates),
-        ("Detect Storage Anomalies", anomalies),
-        ("Storage Breakdown", analyze),
-        ("Cleanup Recommendations", cleanup),
-        ("Application Storage", apps),
-        ("Storage Forecast", forecast),
-        ("Generate Full Report", report),
-    ]
+    """Interactive command-line menu."""
     while True:
-        console.rule("DISKLENS · AI-POWERED STORAGE ANALYZER · READ ONLY")
-        import shutil
+        console.rule("[bold cyan]DISKLENS — Intelligent Disk Analyzer (Read-Only)[/bold cyan]")
+        try:
+            drives_list = get_available_drives()
+            scannable = [d for d in drives_list if d.is_ready]
+            if scannable:
+                drive_summary = " | ".join(
+                    f"{d.path} {render_bar(d.used_bytes, d.total_bytes, width=10)} {format_bytes(d.free_bytes)} free"
+                    for d in scannable[:3]
+                )
+                console.print(f"[bold]Drives:[/] {drive_summary}")
+        except Exception:  # noqa: BLE001, S110
+            pass
 
-        usage = shutil.disk_usage(Path.home())
-        console.print(
-            f"Home volume: {usage.used / 2**30:.1f} GiB used / {usage.total / 2**30:.1f} GiB; "
-            f"{usage.free / 2**30:.1f} GiB free. Choose a path to analyze."
-        )
-        for i, (name, _) in enumerate(options, 1):
-            console.print(f"{i:2}. {name}")
-        choice = typer.prompt("0. Exit | Choose option", default="0")
+        console.print("\n[bold]Select an action:[/bold]")
+        menu_items = [
+            ("Discover & View Drives", drives),
+            ("Scan a Drive or Directory", scan),
+            ("Scan Entire Computer (--all)", "scan_all"),
+            ("Explore Files and Folders", explore),
+            ("Analyze Storage & Categories", analyze),
+            ("Directory Size Hierarchy Tree", tree),
+            ("Find Largest Files", largest),
+            ("Find Duplicate Files", duplicates),
+            ("Identify Cleanup Opportunities", cleanup),
+            ("Understand File or Folder", inspect),
+            ("Application Storage Inventory", apps),
+            ("Storage Forecast & History", forecast),
+            ("Generate Full Report", report),
+        ]
+        for i, (name, _) in enumerate(menu_items, 1):
+            console.print(f" {i:2}. {name}")
+        console.print("  0. Exit")
+
+        choice = typer.prompt("\nChoose option", default="0").strip()
         if choice == "0":
             return
-        if not choice.isdigit() or not 1 <= int(choice) <= len(options):
+        if not choice.isdigit() or not (1 <= int(choice) <= len(menu_items)):
             continue
-        fn = options[int(choice) - 1][1]
+
+        target = menu_items[int(choice) - 1][1]
         try:
-            if fn in (analyze, explore, largest, inspect, risk, duplicates, anomalies):
-                ctx.invoke(fn, path=Path(typer.prompt("Path")))
+            if target == "scan_all":
+                ctx.invoke(scan, path=None, all=True)
+            elif target == scan:
+                path_input = typer.prompt("Enter directory or drive path to scan", default="C:\\")
+                ctx.invoke(scan, path=Path(path_input), all=False)
+            elif target in (explore, inspect, risk):
+                path_input = typer.prompt("Enter path", default=str(Path.home()))
+                ctx.invoke(target, path=Path(path_input))
+            elif target == tree:
+                path_input = typer.prompt("Enter root directory for size tree (or press Enter for latest scan)", default="")
+                p = Path(path_input) if path_input.strip() else None
+                ctx.invoke(tree, path=p)
+            elif target in (analyze, largest, duplicates, anomalies, categories):
+                path_input = typer.prompt("Enter path (or press Enter for latest scan)", default="")
+                p = Path(path_input) if path_input.strip() else None
+                ctx.invoke(target, path=p)
             else:
-                ctx.invoke(fn)
+                ctx.invoke(target)
         except (typer.Exit, KeyboardInterrupt):
-            console.print("Operation stopped.")
+            console.print("[dim]Operation completed or cancelled.[/dim]")
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Error: {exc}[/red]")
 
 
 if __name__ == "__main__":

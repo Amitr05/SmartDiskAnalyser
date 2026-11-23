@@ -24,7 +24,10 @@ def test_exclusions(db, tree):
 
 
 def test_hardlink_accounting(db, tree):
-    os.link(tree / "Temp" / "a.tmp", tree / "hardlink")
+    try:
+        os.link(tree / "Temp" / "a.tmp", tree / "hardlink")
+    except OSError:
+        pytest.skip("Hardlink creation unsupported or denied in this environment")
     result = db.scan(tree)
     assert result["logical_bytes"] == 189
     assert result["unique_bytes"] == 129

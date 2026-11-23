@@ -7,7 +7,7 @@ Team: **Amit Ravi Mishra, Abhishek, Naren**
 
 DiskLens keeps the original smart-filesystem-assistant idea: understand storage, explain known directory purposes, classify files with ML, find verified duplicates, flag anomalies, forecast growth, and help users investigate cleanup opportunities. There is **no GUI, web server, cloud dependency, or required LLM**.
 
-**Release status: working research prototype (0.1), not a certified cleanup utility.** It is Windows-first in path/safety policy and has portable scanning for development. Local validation was performed on Linux; Windows CI is configured but Windows execution has not been verified in this environment. Independent-device research results and real annotator agreement are **not yet available**. See [implementation status](docs/STATUS.md).
+**Release status: working research prototype (0.2), with native Windows support validated on Windows 11.** It is Windows-first in path/safety policy, drive discovery, and registry inspection. Automated tests have been executed and verified natively on Windows 11 (102 passed, 5 skipped). Independent-device research results and real annotator agreement are **not yet available**. See [implementation status](docs/STATUS.md).
 
 ## Safety comes first
 
@@ -48,9 +48,13 @@ PowerShell examples (quote paths with spaces):
 
 ```powershell
 disklens                                      # interactive menu in a real terminal
+disklens drives                               # discover available Windows drives and capacity
+disklens scan --all                           # scan all scannable drives on computer
 disklens scan 'C:\Users\YourName\Downloads'
 disklens analyze                              # latest saved scan
 disklens analyze 'C:\Users\YourName'           # scan, then analyze
+disklens tree --depth 2                       # directory size hierarchy tree
+disklens categories                           # category storage breakdown with usage bars
 disklens scan C: --exclude '.git' --exclude '.venv'
 disklens largest --limit 20
 disklens inspect 'C:\Windows\System32'
@@ -59,11 +63,11 @@ disklens risk 'C:\Users\YourName\AppData\Local\Temp\file.tmp'
 disklens duplicates                           # explicit content hashing opt-in
 disklens anomalies
 disklens cleanup --dry-run                     # review only, never removes anything
-disklens apps
+disklens apps                                 # registry-installed apps & dev ecosystems
 disklens compare                               # latest two same-root scans
 disklens forecast                              # refuses inadequate history
 disklens ask "Which files take the most storage?"
-disklens explore 'C:\Users\YourName'
+disklens explore 'C:\Users\YourName'          # interactive CLI explorer
 disklens report
 ```
 

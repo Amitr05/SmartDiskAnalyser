@@ -1,3 +1,7 @@
+import os
+
+import pytest
+
 from disklens.duplicates import digest, find_duplicates
 
 
@@ -24,9 +28,10 @@ def test_stale_file_reported(db, tree):
 
 
 def test_hardlinks_not_reclaimable_duplicates(db, tree):
-    import os
-
-    os.link(tree / "Temp" / "a.tmp", tree / "hardlink")
+    try:
+        os.link(tree / "Temp" / "a.tmp", tree / "hardlink")
+    except OSError:
+        pytest.skip("Hardlink creation unsupported or denied in this environment")
     scan = db.scan(tree)
     assert not find_duplicates(db, scan["id"])["groups"]
 

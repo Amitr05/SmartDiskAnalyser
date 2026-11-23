@@ -9,8 +9,18 @@ from pathlib import Path
 from .scanner import is_reparse
 
 
+def normalize_identity(dev, ino, size, mtime_ns, ctime_ns):
+    # On Windows NTFS, ctime_ns from lstat (directory entry) and fstat (handle)
+    # can differ by sub-microsecond precision immediately after file creation
+    # due to lazy NTFS metadata updating. We bucket ctime to 1s on Windows to
+    # prevent false-positive file-change detection while preserving strict dev/ino/size/mtime.
+    if os.name == "nt":
+        return dev, ino, size, mtime_ns, ctime_ns // 1_000_000_000
+    return dev, ino, size, mtime_ns, ctime_ns
+
+
 def identity(st):
-    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+    return normalize_identity(st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def open_regular(path):
@@ -27,7 +37,7 @@ def open_regular(path):
 
 def digest(path, expected=None):
     handle, before = open_regular(path)
-    if expected and identity(before) != tuple(expected):
+    if expected and identity(before) != normalize_identity(*expected):
         handle.close()
         raise ValueError("File changed since scan")
     with handle:
@@ -46,8 +56,8 @@ def equal(a, b, expected_a=None, expected_b=None, expected_sha=None):
     try:
         right, sb = open_regular(b)
         with right:
-            if (expected_a is not None and identity(sa) != tuple(expected_a)) or (
-                expected_b is not None and identity(sb) != tuple(expected_b)
+            if (expected_a is not None and identity(sa) != normalize_identity(*expected_a)) or (
+                expected_b is not None and identity(sb) != normalize_identity(*expected_b)
             ):
                 return False
             verified_hash = hashlib.sha256()
