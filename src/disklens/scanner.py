@@ -13,13 +13,16 @@ def is_reparse(st):
     return bool(getattr(st, "st_file_attributes", 0) & 0x400)
 
 
-def metadata(path: Path, root: Path) -> FileRecord:
-    st = path.lstat()
+def metadata(path: Path, root: Path, st: os.stat_result | None = None, depth: int | None = None) -> FileRecord:
+    if st is None:
+        st = path.lstat()
     attrs = getattr(st, "st_file_attributes", 0)
     linked = stat.S_ISLNK(st.st_mode) or is_reparse(st)
     # POSIX st_blocks measures physical allocation. Windows is unknown here,
     # not an invented size equal to the logical size.
     allocated = st.st_blocks * 512 if hasattr(st, "st_blocks") else None
+    if depth is None:
+        depth = len(path.relative_to(root).parts)
     return FileRecord(
         str(path),
         str(path.parent),
@@ -33,7 +36,7 @@ def metadata(path: Path, root: Path) -> FileRecord:
         st.st_dev,
         st.st_ino,
         st.st_nlink,
-        len(path.relative_to(root).parts),
+        depth,
         path.name.startswith(".") or bool(attrs & 2),
         bool(attrs & 4),
         bool(attrs & 1),
@@ -58,23 +61,27 @@ def walk(root: Path, exclude=(), on_error: Callable | None = None) -> Iterator[F
             raise ValueError("Scan root cannot traverse a symlink/junction/reparse point")
     if not root.is_dir():
         raise ValueError("Scan root must be a directory")
-    pending = [root]
+    exclude_patterns = list(exclude)
+    pending = [(root, 0)]
     while pending:
-        directory = pending.pop()
+        directory, dir_depth = pending.pop()
         try:
             current_st = directory.lstat()
             if stat.S_ISLNK(current_st.st_mode) or is_reparse(current_st):
                 if on_error:
                     on_error(str(directory), "directory changed to link/reparse point")
                 continue
+            child_depth = dir_depth + 1
             with os.scandir(directory) as entries:
                 for entry in entries:
                     path = Path(entry.path)
-                    rel = path.relative_to(root).as_posix()
-                    if any(fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(entry.name, p) for p in exclude):
-                        continue
+                    if exclude_patterns:
+                        rel = path.relative_to(root).as_posix()
+                        if any(fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(entry.name, p) for p in exclude_patterns):
+                            continue
                     try:
-                        rec = metadata(path, root)
+                        st = path.lstat()
+                        rec = metadata(path, root, st=st, depth=child_depth)
                         if rec.device != root_st.st_dev:
                             if on_error:
                                 on_error(str(path), "mount boundary not traversed")
@@ -84,8 +91,8 @@ def walk(root: Path, exclude=(), on_error: Callable | None = None) -> Iterator[F
                                 on_error(str(path), "link/reparse point skipped")
                             continue
                         if rec.is_directory:
-                            pending.append(path)
-                        elif not stat.S_ISREG(path.lstat().st_mode):
+                            pending.append((path, child_depth))
+                        elif not stat.S_ISREG(st.st_mode):
                             if on_error:
                                 on_error(str(path), "special file skipped")
                             continue

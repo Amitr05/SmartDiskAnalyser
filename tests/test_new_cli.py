@@ -2,7 +2,7 @@ import json
 
 from typer.testing import CliRunner
 
-from disklens.cli import app
+from disklens.cli import app, resolve_user_path
 
 runner = CliRunner()
 
@@ -97,3 +97,15 @@ def test_cli_scan_all_mocked(monkeypatch, tmp_path, tree):
     assert data["scan_type"] == "all_drives"
     assert data["drives_scanned"] == 1
     assert data["total_files"] == 3
+
+
+def test_resolve_user_path(tmp_path):
+    from pathlib import Path
+
+    # Existing path resolves directly
+    assert resolve_user_path(str(tmp_path)) == tmp_path.resolve()
+    # Empty string returns home
+    assert resolve_user_path("") == Path.home()
+    # None returns home
+    assert resolve_user_path(None) == Path.home()
+

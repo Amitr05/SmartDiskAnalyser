@@ -65,6 +65,25 @@ def normalize(path):
     return Path(value).absolute()
 
 
+def resolve_user_path(path_input: str | Path | None) -> Path:
+    if path_input is None:
+        return Path.home()
+    raw = str(path_input).strip()
+    if not raw:
+        return Path.home()
+    p = Path(raw)
+    if p.exists():
+        return p.resolve()
+    trimmed = raw.lstrip("\\/")
+    cand_home = Path.home() / trimmed
+    if cand_home.exists():
+        return cand_home.resolve()
+    cand_cwd = Path.cwd() / trimmed
+    if cand_cwd.exists():
+        return cand_cwd.resolve()
+    return normalize(p)
+
+
 @contextmanager
 def database(ctx):
     db = Database(ctx.obj["db"])
@@ -264,14 +283,42 @@ def scan(
                 console.print(render_drives_table(get_available_drives()))
                 choice = typer.prompt("Enter drive letter or path to scan (or 'all' for full scan)", default="all")
                 if choice.strip().lower() == "all":
-                    ctx.invoke(scan, path=None, all=True, exclude=exclude)
+                    scan(ctx, path=None, all=True, exclude=exclude)
                     return
                 path = Path(choice.strip())
             else:
                 raise ValueError("Specify a path to scan or pass --all to scan all drives.")
 
-        progress = (lambda n: console.print(f"{n:,} files scanned")) if ctx.obj["verbose"] else None
-        emit(ctx, db.scan(normalize(path), excludes, progress))
+        target_path = normalize(path)
+        is_terminal = ctx.obj["format"] == "terminal" and not ctx.obj.get("output")
+        if is_terminal:
+            console.print(f"[bold cyan]Scanning directory:[/] [bold]{target_path}[/]")
+            if target_path == target_path.anchor or str(target_path).endswith(":\\"):
+                console.print("[dim yellow]Notice: Scanning an entire drive root encompasses hundreds of thousands of files and may take several minutes.[/dim yellow]")
+            with console.status(f"[bold cyan]Scanning {target_path.name or target_path}...[/bold cyan]") as status:
+                def live_progress(count, bytes_scanned=0, current_path=""):
+                    status.update(
+                        f"[bold cyan]Scanning {target_path.name or target_path}:[/] "
+                        f"[bold green]{count:,}[/] files ([dim]{format_bytes(bytes_scanned)}[/dim])"
+                    )
+
+                result = db.scan(target_path, excludes, live_progress)
+
+            rate = int(result["file_count"] / max(result["elapsed"], 0.001))
+            status_style = "green" if result["status"] == "complete" else "yellow"
+            console.rule(f"[bold {status_style}]Scan {result['status'].capitalize()}[/bold {status_style}]")
+            console.print(
+                f"Directory: [bold]{result['root']}[/] | "
+                f"Files: [bold]{result['file_count']:,}[/] | "
+                f"Storage: [bold green]{format_bytes(result['unique_bytes'])}[/] | "
+                f"Time: [bold]{result['elapsed']:.1f}s[/] ([dim]{rate:,} files/s[/dim])"
+            )
+            if result.get("error_count", 0) > 0:
+                console.print(f"[dim yellow]({result['error_count']:,} inaccessible system/permission items skipped)[/dim yellow]")
+            console.print("[dim]Run 'disklens analyze' or 'disklens tree' to inspect findings.[/dim]\n")
+        else:
+            progress = (lambda n, *_: console.print(f"{n:,} files scanned")) if ctx.obj["verbose"] else None
+            emit(ctx, db.scan(target_path, excludes, progress))
 
 
 def selected(ctx, db, path=None, scan_id=None):
@@ -1016,24 +1063,31 @@ def interactive(ctx):
         target = menu_items[int(choice) - 1][1]
         try:
             if target == "scan_all":
-                ctx.invoke(scan, path=None, all=True)
+                scan(ctx, path=None, all=True)
             elif target == scan:
-                path_input = typer.prompt("Enter directory or drive path to scan", default="C:\\")
-                ctx.invoke(scan, path=Path(path_input), all=False)
-            elif target in (explore, inspect, risk):
+                path_input = typer.prompt("Enter directory or drive path to scan", default=str(Path.home()))
+                p = resolve_user_path(path_input) if path_input.strip() else Path.home()
+                scan(ctx, path=p, all=False)
+            elif target == explore:
                 path_input = typer.prompt("Enter path", default=str(Path.home()))
-                ctx.invoke(target, path=Path(path_input))
+                p = resolve_user_path(path_input)
+                explore(ctx, path=p)
+            elif target in (inspect, risk):
+                path_input = typer.prompt("Enter path", default=str(Path.home()))
+                p = resolve_user_path(path_input)
+                target(ctx, path=p)
             elif target == tree:
                 path_input = typer.prompt("Enter root directory for size tree (or press Enter for latest scan)", default="")
-                p = Path(path_input) if path_input.strip() else None
-                ctx.invoke(tree, path=p)
+                p = resolve_user_path(path_input) if path_input.strip() else None
+                tree(ctx, path=p)
             elif target in (analyze, largest, duplicates, anomalies, categories):
                 path_input = typer.prompt("Enter path (or press Enter for latest scan)", default="")
-                p = Path(path_input) if path_input.strip() else None
-                ctx.invoke(target, path=p)
+                p = resolve_user_path(path_input) if path_input.strip() else None
+                target(ctx, path=p)
             else:
-                ctx.invoke(target)
+                target(ctx)
         except (typer.Exit, KeyboardInterrupt):
+
             console.print("[dim]Operation completed or cancelled.[/dim]")
         except Exception as exc:  # noqa: BLE001
             console.print(f"[red]Error: {exc}[/red]")

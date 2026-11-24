@@ -1,6 +1,7 @@
 """SQLite-backed streaming scans and historical metadata; no file contents stored."""
 
 import json
+import os
 import shutil
 import sqlite3
 import time
@@ -38,14 +39,17 @@ class Database:
     def __init__(self, path: Path):
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
+            self.path = path.absolute()
+            self.conn = sqlite3.connect(self.path)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.executescript(SCHEMA)
+        except (OSError, sqlite3.OperationalError):
             fallback = Path.cwd() / ".disklens" / path.name
             fallback.parent.mkdir(parents=True, exist_ok=True)
-            path = fallback
-        self.path = path.absolute()
-        self.conn = sqlite3.connect(path)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA)
+            self.path = fallback.absolute()
+            self.conn = sqlite3.connect(self.path)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.executescript(SCHEMA)
         columns = {r[1] for r in self.conn.execute("PRAGMA table_info(scans)")}
         if "exclusions" not in columns:
             self.conn.execute("ALTER TABLE scans ADD COLUMN exclusions TEXT DEFAULT '[]'")
@@ -92,7 +96,7 @@ class Database:
             (usage.total, usage.free, usage.used, scan_id),
         )
         self.conn.commit()
-        count = errors = 0
+        count = errors = scanned_bytes = 0
 
         def error(path, message):
             nonlocal errors
@@ -125,11 +129,16 @@ class Database:
                         json.dumps(rec.to_dict()),
                     ),
                 )
-                count += not rec.is_directory
-                if count and count % 500 == 0:
+                if not rec.is_directory:
+                    count += 1
+                    scanned_bytes += rec.size
+                if count and count % 200 == 0:
                     self.conn.commit()
                     if progress:
-                        progress(count)
+                        try:
+                            progress(count, scanned_bytes, rec.path)
+                        except TypeError:
+                            progress(count)
         except KeyboardInterrupt:
             status = "cancelled"
         except (OSError, ValueError) as exc:
@@ -144,17 +153,20 @@ class Database:
             (SELECT MAX(size) AS size FROM files WHERE scan_id=? AND is_directory=0 GROUP BY device,inode)""",
             (scan_id,),
         ).fetchone()[0]
-        allocated = 0
-        for row in self.conn.execute(
-            """SELECT metadata FROM files WHERE scan_id=? AND is_directory=0
-                                        GROUP BY device,inode""",
-            (scan_id,),
-        ):
-            value = json.loads(row[0])["allocated"]
-            if value is None:
-                allocated = None
-                break
-            allocated += value
+        if os.name == "nt":
+            allocated = None
+        else:
+            allocated = 0
+            for row in self.conn.execute(
+                """SELECT metadata FROM files WHERE scan_id=? AND is_directory=0
+                                            GROUP BY device,inode""",
+                (scan_id,),
+            ):
+                value = json.loads(row[0])["allocated"]
+                if value is None:
+                    allocated = None
+                    break
+                allocated += value
         elapsed = time.perf_counter() - clock
         if errors and status == "complete":
             status = "partial"
